@@ -79,7 +79,8 @@ SunmmioMlirCall::SunmmioMlirCall(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 SunMMIOValue SunmmioMlirCall::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
-    DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset) {
+    DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
+    bool preserve_region_rank) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
@@ -121,9 +122,21 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   mlir::SmallVector<int64_t, 4> tiled_dims;
 
   shape.reserve(extents.size());
+  bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
   for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-    if (extents[i] != 1) {
-      shape.push_back(extents[i]);
+    if (preserve_exact_rank || extents[i] != 1) {
+      int64_t view_extent = extents[i];
+      if (preserve_exact_rank && extents[i] == memtensor_ty.getShape()[i]) {
+        // tc.mma must cover every tiled layout dimension completely.  Keep
+        // the logical memtensor shape for user-visible copies, but expose its
+        // already-allocated padded carrier to MMA (for example M=16 in a
+        // 32-row ZZ block).
+        view_extent = memtensor_ty.getLayout().getDimSize(i);
+        ICHECK_GE(view_extent, extents[i])
+            << "tl.mma_sunmmio layout extent cannot be smaller than its "
+               "logical buffer extent";
+      }
+      shape.push_back(view_extent);
       tiled_dims.push_back(i);
     }
   }
@@ -133,9 +146,10 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     shape.push_back(1);
     tiled_dims.push_back(0);
   }
-  ICHECK(shape.size() == 1 || shape.size() == 2)
-      << "tl.tileop.region expects one or two tiled dims with extent != 1, "
-         "but got "
+  ICHECK_GE(shape.size(), 1U)
+      << "tl.tileop.region expects at least one tiled dimension";
+  ICHECK_LE(shape.size(), 3U)
+      << "tl.tileop.region expects at most three tiled dimensions, but got "
       << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();
@@ -582,9 +596,13 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto dst_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(dst.getType());
     ICHECK(dst_ty) << "tl.dma_copy expects destination to be a suvm.tile_view";
 
+    mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
+    mlir::suvm::Unit unit = mlir::suvm::getTileViewMeta(dst).memorySpace ==
+                                    mlir::suvm::MemorySpace::asram
+                                ? mlir::suvm::Unit::Odma1
+                                : mlir::suvm::Unit::Odma0;
     auto copy_op = mlir::suvm::CopyAsyncOp::create(
-        ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
-        mlir::suvm::OdmaChannelAttr{});
+        ctx_.builder, type.MakeDebugLoc("dma_copy"), token_ty, src, dst, unit);
 
     ICHECK(!result_name.empty()) << "tl.dma_copy expects a token result";
     ICHECK(copy_op && copy_op->getNumResults() == 1)
@@ -617,9 +635,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     ICHECK(dst_ty) << "tl.sunmmio_layout_transform expects destination to be a "
                       "suvm.tile_view";
 
+    mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
     auto transform_op = mlir::suvm::TransformAsyncOp::create(
-        ctx_.builder, type.MakeDebugLoc("sunmmio_layout_transform"), src, dst,
-        mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
+        ctx_.builder, type.MakeDebugLoc("sunmmio_layout_transform"), token_ty,
+        src, dst, mlir::suvm::PadModeAttr{}, mlir::suvm::Unit::Odma1);
 
     ICHECK(!result_name.empty())
         << "tl.sunmmio_layout_transform expects a token result";
@@ -653,9 +672,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     ICHECK(dst_ty)
         << "tl.sunmmio_transpose expects destination to be a suvm.tile_view";
 
+    mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
     auto transpose_op = mlir::suvm::TransposeAsyncOp::create(
-        ctx_.builder, type.MakeDebugLoc("sunmmio_transpose"), src, dst,
-        mlir::suvm::OdmaChannelAttr{});
+        ctx_.builder, type.MakeDebugLoc("sunmmio_transpose"), token_ty, src,
+        dst, mlir::suvm::Unit::Odma1);
 
     ICHECK(!result_name.empty())
         << "tl.sunmmio_transpose expects a token result";
@@ -701,13 +721,17 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
                                              : mlir::suvm::McastDirection::col;
 
     auto create_mcast = [&]() -> mlir::Value {
+      mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
+      mlir::suvm::Unit unit = direction == mlir::suvm::McastDirection::row
+                                  ? mlir::suvm::Unit::Odma1
+                                  : mlir::suvm::Unit::Odma0;
       auto mcast_op = mlir::suvm::MulticastTokOp::create(
-          ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
-          direction, mlir::suvm::OdmaChannelAttr{});
-      ICHECK(succeeded(mcast_op.verify()))
+          ctx_.builder, type.MakeDebugLoc("broadcast"), token_ty, src, dst,
+          mask, direction, unit);
+      ICHECK(mcast_op.verify().succeeded())
           << "tl.broadcast_ generated an invalid suvm.mcast_tok";
-      ICHECK(
-          succeeded(mcast_op.verifyWithDeviceArch(mlir::suvm::DeviceArch::a4e)))
+      ICHECK(mcast_op.verifyWithDeviceArch(mlir::suvm::DeviceArch::a4e)
+                 .succeeded())
           << "tl.broadcast_ violates A4E multicast data-path constraints";
       return mcast_op->getResult(0);
     };
@@ -794,12 +818,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
     bool trans_b =
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
-    mlir::UnitAttr trans_attr =
-        trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
-
+    mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
     auto mma_op = mlir::suvm::TcMmaOp::create(
-        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
-        trans_attr);
+        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), token_ty, c, a, w, c,
+        accumulate, trans_b);
 
     ICHECK(!result_name.empty()) << "tl.mma_sunmmio expects a token result";
     ICHECK(mma_op && mma_op->getNumResults() == 1)

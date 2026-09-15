@@ -211,47 +211,70 @@ if(USE_SUNMMIO)
     set(LLVM_PROJECT_BUILD_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project-build")
 
     # 3. Preemptively set include directories and module paths
-    set(MLIR_INCLUDE_DIRS
-      "${LLVM_PROJECT_DIR}/mlir/include"
-      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
-      CACHE PATH "MLIR include directories" FORCE
-    )
-    set(LLVM_INCLUDE_DIRS
-      "${LLVM_PROJECT_DIR}/llvm/include"
-      "${LLVM_PROJECT_BUILD_DIR}/include"
-      CACHE PATH "LLVM include directories" FORCE
-    )
+    if(NPUIR_USE_LLVM_INSTALL_DIR)
+      set(MLIR_INCLUDE_DIRS
+        "${NPUIR_USE_LLVM_INSTALL_DIR}/include"
+        CACHE PATH "MLIR include directories" FORCE
+      )
+      set(LLVM_INCLUDE_DIRS
+        "${NPUIR_USE_LLVM_INSTALL_DIR}/include"
+        CACHE PATH "LLVM include directories" FORCE
+      )
+    else()
+      set(MLIR_INCLUDE_DIRS
+        "${LLVM_PROJECT_DIR}/mlir/include"
+        "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+        CACHE PATH "MLIR include directories" FORCE
+      )
+      set(LLVM_INCLUDE_DIRS
+        "${LLVM_PROJECT_DIR}/llvm/include"
+        "${LLVM_PROJECT_BUILD_DIR}/include"
+        CACHE PATH "LLVM include directories" FORCE
+      )
 
-    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/llvm/cmake/modules")
-    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/mlir/cmake/modules")
+      list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/llvm/cmake/modules")
+      list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/mlir/cmake/modules")
+    endif()
 
-    # 4. Mock find_package to bypass NPU-IR's MLIR/LLVM checks
-    # This macro will intercept find_package calls for MLIR and LLVM
-    macro(find_package)
-      set(_find_args "${ARGN}")
-      list(GET _find_args 0 _pkg_name)
-      if(_pkg_name STREQUAL "MLIR" OR _pkg_name STREQUAL "LLVM")
-        set(${_pkg_name}_FOUND ON PARENT_SCOPE)
-        set(${_pkg_name}_FOUND ON) # Also set in current scope for immediate use
-        message(STATUS "Mocking find_package(${_pkg_name}) to bypass NPU-IR check")
-      else()
-        _find_package(${ARGN})
-      endif()
-    endmacro()
+    # 4. An in-tree LLVM build already defines the MLIR/LLVM targets, so its
+    # package lookup must be bypassed.  A pre-installed LLVM build needs the
+    # real find_package call to import those targets from its CMake package.
+    if(NPUIR_USE_LLVM_INSTALL_DIR)
+      find_package(LLVM REQUIRED CONFIG
+        PATHS "${NPUIR_USE_LLVM_INSTALL_DIR}/lib/cmake/llvm"
+        NO_DEFAULT_PATH
+      )
+      find_package(MLIR REQUIRED CONFIG
+        PATHS "${NPUIR_USE_LLVM_INSTALL_DIR}/lib/cmake/mlir"
+        NO_DEFAULT_PATH
+      )
+    else()
+      macro(find_package)
+        set(_find_args "${ARGN}")
+        list(GET _find_args 0 _pkg_name)
+        if(_pkg_name STREQUAL "MLIR" OR _pkg_name STREQUAL "LLVM")
+          set(${_pkg_name}_FOUND ON PARENT_SCOPE)
+          set(${_pkg_name}_FOUND ON) # Also set in current scope for immediate use
+          message(STATUS "Mocking find_package(${_pkg_name}) to bypass NPU-IR check")
+        else()
+          _find_package(${ARGN})
+        endif()
+      endmacro()
 
-    # Pre-set the variables NPU-IR expects from find_package
-    set(MLIR_FOUND ON CACHE INTERNAL "")
-    set(LLVM_FOUND ON CACHE INTERNAL "")
-    set(MLIR_INCLUDE_DIRS
-      "${LLVM_PROJECT_DIR}/mlir/include"
-      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
-      CACHE PATH "" FORCE
-    )
-    set(LLVM_INCLUDE_DIRS
-      "${LLVM_PROJECT_DIR}/llvm/include"
-      "${LLVM_PROJECT_BUILD_DIR}/include"
-      CACHE PATH "" FORCE
-    )
+      # Pre-set the variables NPU-IR expects from the in-tree LLVM build.
+      set(MLIR_FOUND ON CACHE INTERNAL "")
+      set(LLVM_FOUND ON CACHE INTERNAL "")
+      set(MLIR_INCLUDE_DIRS
+        "${LLVM_PROJECT_DIR}/mlir/include"
+        "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+        CACHE PATH "" FORCE
+      )
+      set(LLVM_INCLUDE_DIRS
+        "${LLVM_PROJECT_DIR}/llvm/include"
+        "${LLVM_PROJECT_BUILD_DIR}/include"
+        CACHE PATH "" FORCE
+      )
+    endif()
 
     add_subdirectory(3rdparty/NPU-IR "${TILELANG_NPUIR_BINARY_DIR}" EXCLUDE_FROM_ALL)
     list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
@@ -337,6 +360,8 @@ if(USE_SUNMMIO)
     SOURCE_DIR "${TILELANG_HIGHS_SOURCE_DIR}"
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DCMAKE_INSTALL_PREFIX=${TILELANG_HIGHS_INSTALL_DIR}
       -DCMAKE_INSTALL_LIBDIR=lib
       -DBUILD_SHARED_LIBS=OFF
