@@ -415,6 +415,15 @@ def LegalizeSunmmioGemm():
     return _ffi_api.LegalizeSunmmioGemm()  # type: ignore
 
 
+def LegalizeSunmmioBatchGemmViews():
+    """Materialize partial/nonzero-min Batch GEMM operands in compact buffers.
+
+    Runs before SRAM scope and layout inference so the compact allocations get
+    physical layouts and legal RSRAM-to-ASRAM/WSRAM transfer routes.
+    """
+    return _ffi_api.LegalizeSunmmioBatchGemmViews()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
