@@ -158,6 +158,9 @@ def bf16_gemm_with_broadcast(
     outer_guard=False,
     source_col=0,
     broadcast_b=False,
+    broadcast_b_direction="v",
+    broadcast_b_size=-1,
+    broadcast_b_source=None,
     put_source=(0, 0),
     block_shape=(32, 32, 32),
 ):
@@ -213,7 +216,11 @@ def bf16_gemm_with_broadcast(
                     if not guarded_put:
                         if broadcast_b:
                             T.comm.broadcast(
-                                B[k * block_K : k * block_K + block_K, 0:block_N], B_shared, (0, cid % T.mesh_ncols()), direction="v"
+                                B[k * block_K : k * block_K + block_K, 0:block_N],
+                                B_shared,
+                                (0, cid % T.mesh_ncols()) if broadcast_b_source is None else broadcast_b_source,
+                                direction=broadcast_b_direction,
+                                size=broadcast_b_size,
                             )
                         else:
                             T.copy(B[k * block_K, 0], B_shared)
@@ -263,6 +270,55 @@ def test_broadcast_gather_selects_source_slot_and_initializes_senders(source_col
     assert selected == [(source_col * 32, 0), (source_col * 32, 1024)]
     fills = find_call_args(mod, "tl.tileop.fill")
     assert any(args[0].args[0].buffer.same_as(send) and args[1].value == 0 for args, _ in fills)
+
+
+def test_broadcast_gather_stages_full_mesh_b_operand():
+    mod = apply_pipeline_up_to_legalize_gemm(
+        tvm.IRModule(
+            {
+                "main": bf16_gemm_with_broadcast(
+                    broadcast_b=True,
+                    broadcast_b_direction="all",
+                    broadcast_b_source=(2, 3),
+                )
+            }
+        )
+    )
+    gathers = find_call_args(mod, "tl.tileop.comm_allgather")
+    full_mesh = [(args, attrs) for args, attrs in gathers if int(args[2]) == 2]
+    assert len(full_mesh) == 1
+    receive = full_mesh[0][0][1].args[0].buffer
+    assert [int(x) for x in receive.shape] == [16 * 32, 32]
+    selected = []
+    for args, _ in find_call_args(mod, "tl.tileop.copy"):
+        region = args[0]
+        if isinstance(region, tvm.tir.Call) and region.args[0].buffer.same_as(receive):
+            selected.append(int(region.args[0].indices[0]))
+    assert selected == [11 * 32]
+    loop = _find_k_loop_for(mod)
+    copy_op = tvm.tir.op.Op.get("tl.tileop.copy")
+    assert any(_is_call(stmt, copy_op) and stmt.value.args[0].args[0].buffer.same_as(receive) for stmt in loop.body.seq)
+    lowered = tl.transform.LowerTileOp()(mod)
+    assert count_call_op(lowered, "tl.broadcast_") == 6
+
+
+def test_legalize_sunmmio_gemm_preserves_unsupported_b_broadcast():
+    mod = apply_pipeline_up_to_legalize_gemm(
+        tvm.IRModule(
+            {
+                "main": bf16_gemm_with_broadcast(
+                    broadcast_b=True,
+                    broadcast_b_size=512,
+                )
+            }
+        )
+    )
+    broadcasts = find_call_args(mod, "tl.tileop.comm_broadcast")
+    assert len(broadcasts) == 1
+    assert int(broadcasts[0][0][3]) == 512
+    assert count_call_op(mod, "tl.tileop.comm_allgather") == 1
+    assert count_call_op(mod, "tl.tileop.gemm_py") == 2
+    tl.transform.LowerTileOp()(mod)
 
 
 def test_legalize_sunmmio_gemm_rejects_partial_broadcast_writer():
