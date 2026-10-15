@@ -284,6 +284,8 @@ def test_comm_all_gather_kernel_codegen_validates_with_npuir_opt(
         direction = line.split("direction =", 1)[1].lstrip()
         expected_unit = "odma1" if direction.startswith("row") else "odma0"
         assert f"<unit = {expected_unit}>" in line
+
+
 def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
     src = _validate_kernel(
         comm_all_reduce_horizontal_kernel(),
