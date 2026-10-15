@@ -2828,18 +2828,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
     operands.reserve(4);
-    operands.push_back(
-        EmitRegionCall(op->args[0], /*byte_offset=*/0,
-                       /*use_layout_covered_shape=*/false,
-                       /*preserve_region_rank=*/true));
-    operands.push_back(
-        EmitRegionCall(op->args[1], /*byte_offset=*/0,
-                       /*use_layout_covered_shape=*/false,
-                       /*preserve_region_rank=*/true));
-    operands.push_back(
-        EmitRegionCall(op->args[2], acc_offset_byte,
-                       /*use_layout_covered_shape=*/false,
-                       /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[0], /*byte_offset=*/0,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[1], /*byte_offset=*/0,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
 
     MarkVisitedNodeType(op->args[5]->GetTypeKey());
     arith::Analyzer analyzer;
